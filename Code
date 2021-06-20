@@ -1,0 +1,469 @@
+#define LEncoderPin 3     
+#define REncoderPin 2
+
+#include <AFMotor.h>
+#include <PID_v2.h> 
+AF_DCMotor left_motor(1, MOTOR34_1KHZ);  // left motor to M1 on motor control board
+AF_DCMotor right_motor(3, MOTOR12_1KHZ); // right motor to M3 on motor control board
+
+volatile int leftEncoderCount = 0;
+volatile int rightEncoderCount = 0;
+
+int prevLeftEncoderCount = 0;
+int prevRightEncoderCount = 0;
+
+long unsigned int prevLeftInterruptTime = 0;
+long unsigned int prevRightInterruptTime = 0;
+int errorTime = 5;
+
+long unsigned int reachedEncoderCount=0;
+int DelayTime = 200;
+
+
+int pushButton=A2;
+long rightPWM;
+long leftPWM;
+int rightIR=A5;
+int leftIR=A0;
+int trigger=A4;
+int echo=A3;
+int photo=A1;
+int rightObstacle=HIGH;
+int leftObstacle=HIGH;
+long duration;
+int range;
+int photoDefault=10;
+int buttonState=HIGH;
+int state=6;
+int angle=0;
+String where;
+
+long lastDriveCheck=0;
+long currentDriveCheck=0;
+long lastPrint=0;
+long lastUScheck=0;
+
+long timeToTake;
+const int numReadings = 10;
+int USreadings[numReadings];      
+int USreadIndex = 0;              
+int UStotal = 0;                  
+int USaverage = 0;  
+int PSreadings[numReadings];      
+int PSreadIndex = 0;              
+int PStotal = 0;                  
+int PSaverage = 0;   
+
+int photoReading=0;
+int drove=0;
+
+int error=0;
+
+boolean marker=false;
+boolean reached=false;
+boolean obstacle=false;
+boolean before =false;
+boolean beside = false;
+boolean past = false;
+boolean navigating=false;
+int side=0;
+int numObstacles=0;
+
+int entered=1;
+long prevCheck=0;
+long horizontal=0;
+long xTime=0;
+long yTime=0;
+
+void setup() {
+  // put your setup code here, to run once:
+  attachInterrupt(1, countLEncoder, RISING); //calls on any CHANGE on pin 3 (interrupt #1, soldered to Pin3) 
+  attachInterrupt(0, countREncoder, RISING); //calls on any CHANGE on pin 2 (interrupt #0, connected to header on Pin2) 
+  interrupts();
+  Serial.begin (9600);    // set up Serial library at 115200 bps
+  Serial.println("Task 3");
+  left_motor.run(RELEASE);
+  right_motor.run(RELEASE);
+  pinMode(trigger,OUTPUT);
+  pinMode(echo,INPUT);
+  pinMode(photo,INPUT);
+  
+  
+  for (int thisReading = 0; thisReading < numReadings; thisReading++) {
+    USreadings[thisReading] = 0;
+  }
+  for (int thisReading = 0; thisReading < numReadings; thisReading++) {
+    PSreadings[thisReading] = 0;
+  }
+  while(buttonState==HIGH){
+    buttonState=digitalRead(pushButton);
+    delay(10);
+  }
+  left_motor.setSpeed(100);
+  right_motor.setSpeed(140);
+  leftPWM=100;
+  rightPWM=140;
+  
+ 
+  checkSensors();//doesnt let car start driving until sensors are checked
+}
+
+void loop() {
+ 
+
+  switch(state){//switch case statement for non blocking code
+    case 0:
+      stopDrivingSpecial();
+      break;
+    case 1:
+      driveStraight();
+      break;
+    case 2:
+      driveBack(100,140);
+      break;
+    case 3:
+      where="RIGHT";
+      pivot(where,angle);
+      break;
+    case 4:
+      where="LEFT";
+      pivot(where,angle);
+      break;
+    case 5:
+      stall();
+      break;
+  }
+  
+ 
+
+
+  if((millis()-lastUScheck)>70){//non blocking check of ultrasonic sensors every 70 milliseconds
+    ultraSonic();
+    lastUScheck=millis();
+  }
+  
+  if((millis()-lastPrint)>300){
+    //2display();
+    lastPrint=millis();
+  }
+  ReactObstacles();//sense the environment
+  navigate();//decide what to do based on the environment
+  
+ 
+}
+void navigate(){
+   
+
+  if(!reached){//if goal has not been reached follow this sequence
+      if(obstacle ){//if obstacle was encountered, perform obstacle avoidance sequence  
+        navigating=true;//boolean to keep track of if we are navigating around obstacle or not   
+         switch(side){//switch case statement for which side of the obstacle we are on, non blocking by using switch case
+            case 0://approaching obstacle
+              stall();
+              pivotLeft();//avoid the obstacle by going left
+              beside=true;//beside the obstacle
+              navigateSide();//code to navigate the side of an obstacle
+              xTime+=horizontal;//used for calculation of return trip
+              side=1;//indicates we ar enow on the left of the box
+              break;       
+            case 1:
+              checkPosition();//checks if we are before beside or after the box
+              pivotRight();
+              navigateSide();
+              side=2;
+              break;
+            case 2:
+              if(numObstacles==0){// on the first obstacle the vehicle returns to a straight line, but on the second obstacle the car does not resume the straight line and simply drives straight to find the goal
+                pivotRight();
+                prevCheck=millis();
+                while((millis()-prevCheck)<horizontal){//drives horizontally an equal amount of distance as was previously
+                  driveStraight();
+                }
+                stall();
+              }
+              side=3;
+              break;
+            case 3:
+              if(numObstacles==0){
+                pivotLeft();
+              }
+              obstacle=false;//obstacle is avoided, booleans are set to indicate that
+              navigating=false;
+              side=0;
+              numObstacles++;
+              break;
+         }
+      }
+      else{//if no obstacle, drive straight
+        state=1;
+      }
+  }
+  else{//if reached 
+    state=1;//once goal is reached, return driving straight
+  }
+  if(marker&&(!reached)){ //goal is reached, pivot 180 degrees
+    marker=false;
+    reached=true;
+    stall();
+    pivotLeft();
+    prevCheck=millis();
+    while((millis()-prevCheck)<(xTime/2)){//using memory to travel horizontal distance necessary to avoid all obstacles on the way back
+      driveStraight();
+    }
+    stall();
+    pivotLeft();
+    stall();
+    reachedEncoderCount=leftEncoderCount;
+  }
+  if(marker&&reached&&((leftEncoderCount-reachedEncoderCount)>200)){//start line is reached, stop the vehicle
+    stopDrivingSpecial();
+  }
+}
+void checkPosition(){//using IR sensor we detect where on the side of the obstalce we are
+  if(digitalRead(rightIR)==HIGH){
+      before=true;
+    }
+    else{
+      beside=true;
+    }
+}
+
+void navigateSide(){//side of box is navigated checking which of the three places beside the box is using the IR sensor
+   if(side==0){//if horizontal part of box is being navigated, we record time it takes for later use in return trip
+      prevCheck=millis();
+   }
+   if(before){//if we are before drive straight
+      while(digitalRead(rightIR)==HIGH){
+        driveStraight();
+        Serial.print("");
+      }
+      before=false;
+      beside=true;
+   }
+   if(beside){// if we are beside, while the IR sensor is detecting object, drive straight
+      while(digitalRead(rightIR)==LOW){
+        driveStraight();
+        Serial.print("");
+      }
+      beside=false;
+      past=true;
+   }
+   if(past){//once IR sensor stops detecting, drive forward a little more to clear side before turning
+      prevCheck=millis();
+      while((millis()-prevCheck)<200){
+        driveStraight();
+        Serial.print("");
+      }
+     past=false;
+   }
+   if(side==0){
+      horizontal=millis()-prevCheck;
+   }
+    stall();
+}
+void ReactObstacles(){//reads left IR sensor and UltraSonic sensor to detect whether there is an obstalce
+  leftObstacle=digitalRead(leftIR);
+  rightObstacle=digitalRead(rightIR);
+  if(((leftObstacle==LOW)|| range<20)&&!navigating){
+  
+    obstacle=true;
+  }
+  photoSensor();//reads photosensor
+  
+  if(photoReading>40){//if reflection is high, we are ontop of the tape
+    marker=true;
+  }
+  
+}
+void stall(){//used to kill physical momentum before next instruction
+  left_motor.run(RELEASE);
+  right_motor.run(RELEASE);
+  delay(1000);
+}
+
+void driveBack(int leftSpeed, int rightSpeed){
+  left_motor.setSpeed(leftSpeed);
+  right_motor.setSpeed(rightSpeed);
+  left_motor.run(BACKWARD);
+  right_motor.run(BACKWARD);
+  delay(100);
+}
+void turnAround(int leftSpeed, int rightSpeed){
+  left_motor.setSpeed(leftSpeed);
+  right_motor.setSpeed(rightSpeed);
+  while((leftEncoderCount-prevLeftEncoderCount)<22){
+    left_motor.run(FORWARD);
+    right_motor.run(BACKWARD);
+    Serial.print(" ");
+    
+  }
+  left_motor.run(RELEASE);
+  right_motor.run(RELEASE);
+  
+}
+void pivot(String dir,int angle){
+  prevLeftEncoderCount=leftEncoderCount;
+  int turn=angle/8;
+  Serial.println(turn);
+  if(dir=="RIGHT"){
+    while((leftEncoderCount-prevLeftEncoderCount)<turn){
+      left_motor.run(FORWARD);
+      right_motor.run(BACKWARD);
+      Serial.print(" ");
+    }
+    stopDriving();
+    delay(100);
+  }
+  else{
+    while((leftEncoderCount-prevLeftEncoderCount)<turn){
+      left_motor.run(BACKWARD);
+      right_motor.run(FORWARD);
+      Serial.print(" ");
+    }
+    stopDriving();
+    delay(100);
+  }
+  }
+void pivotRight(){
+  left_motor.setSpeed(255);
+  prevCheck=millis();
+  while((millis()-prevCheck)<370){
+    left_motor.run(FORWARD);
+    Serial.println("");
+  }
+stall();
+}
+ void pivotLeft(){
+  right_motor.setSpeed(255);
+  prevCheck=millis();
+  while((millis()-prevCheck)<400){
+    right_motor.run(FORWARD);
+    Serial.print("");
+  }
+stall();
+}
+void stopDriving(){
+  left_motor.setSpeed(0);
+  right_motor.setSpeed(0);
+  left_motor.run(FORWARD);
+  right_motor.run(FORWARD);
+ 
+}
+void stopDrivingSpecial(){
+  left_motor.setSpeed(0);
+  right_motor.setSpeed(0);
+  left_motor.run(FORWARD);
+  right_motor.run(FORWARD);
+  Serial.println(" STOPPED");
+  while(true){
+    
+  }
+}
+void countLEncoder(){ // encoder count function that eliminates encoder error by not counting if interrupts are called within microseconds of each other
+   long currentTime= millis();
+   if (currentTime- prevLeftInterruptTime >=errorTime){
+      prevLeftInterruptTime=currentTime;
+      leftEncoderCount=leftEncoderCount+1;
+   }
+}
+
+void countREncoder(){ // interrupt function for right encoder
+    long currentTime=millis();
+    if (currentTime-prevRightInterruptTime>=errorTime){
+      prevRightInterruptTime=currentTime;
+      rightEncoderCount=rightEncoderCount+1;
+    }
+}
+void display(){
+  /*
+  Serial.print("LEFT IR ");
+  Serial.print(leftObstacle);
+  Serial.print("   ");
+  Serial.print("RIGHT IR ");
+  Serial.println(rightObstacle);
+  Serial.print("Distance: ");
+  Serial.println(range);
+  */
+  Serial.println(photoReading);
+}
+
+
+void ultraSonic(){
+  digitalWrite(trigger,LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigger,HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigger,LOW);
+  duration=pulseIn(echo,HIGH);
+  range=(duration*.034)/2;
+  
+  
+  UStotal=UStotal-USreadings[USreadIndex];//smoothing of values
+  USreadings[USreadIndex]=range;
+  UStotal=UStotal+USreadings[USreadIndex];
+  USreadIndex++;
+  if (USreadIndex >= numReadings) {
+    USreadIndex = 0;
+  }
+  range = UStotal / numReadings;
+  
+}
+void photoSensor(){
+  
+  photoReading=analogRead(photo);
+  
+  PStotal=PStotal-PSreadings[PSreadIndex];
+  PSreadings[PSreadIndex]=photoReading;
+  PStotal=PStotal+PSreadings[PSreadIndex];
+  PSreadIndex++;
+  
+  if (PSreadIndex >= numReadings) {
+    PSreadIndex = 0;
+  }
+  photoReading = PStotal / numReadings;
+ 
+  
+}
+
+void driveStraight(){// Drives car straight by taking difference between encoder counts and setting speeds accordingly to correct for error
+  
+  error=(1.0)*(leftEncoderCount-rightEncoderCount);
+  leftPWM=(int)round(255-error);
+  rightPWM=(int)round(255+error);
+  if(leftPWM>255){
+    leftPWM=255;
+  }
+  if(leftPWM<0){
+    leftPWM=0;
+  }
+  if(rightPWM>255){
+    rightPWM=255;
+  }
+  if(rightPWM<0){
+    rightPWM=0;
+  }
+  left_motor.setSpeed(leftPWM);
+  right_motor.setSpeed(rightPWM);
+  left_motor.run(FORWARD);
+  right_motor.run(FORWARD);
+  Serial.print(" ");
+}
+void checkSensors(){//perform self check of sensors
+   ultraSonic();
+  int var=range;
+  while(var>range-10){
+    ultraSonic();
+    Serial.println("ultrasonic");
+  }
+  var=analogRead(photo);
+  while(var==analogRead(photo)){
+    analogRead(photo);
+    Serial.println("photo");
+  }
+  while(digitalRead(leftIR)==HIGH){
+   Serial.println("left");
+  }
+  while(digitalRead(rightIR)==HIGH){
+    Serial.println("right");
+  }
+}
